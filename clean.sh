@@ -1,19 +1,23 @@
 #! /bin/sh
 
-set -e
+[ -n "${DEBUG:-}" ] && set -x
+
 test -f auto_targets.mk && rm auto_targets.mk
 
-for version
-do
-    remove_images=
-    for idfile in .image-id.raw .image-id.squashed; do
-        test ! -f "$version/$idfile" || remove_images+=" $(cat "$version/$idfile")"
-    done
-
-    for image in $remove_images; do
-        docker rm -f $(docker ps -q -a -f "ancestor=$image") 2>/dev/null || :
-        docker rmi -f "$image" || :
-    done
-
-    rm -rf "$version"/.image-id*
+for version; do
+  for id_file in .image-id .image-id-from; do
+    id_path="$version"/"$id_file"
+    if [ -f "$id_path" ]; then
+      image="$(cat "$id_path")"
+      test -n "$image" || continue
+      docker inspect "$image" > /dev/null 2>&1 || continue
+      containers="$(docker ps -q -a -f ancestor="$image")"
+      if [ -n "$containers" ]; then
+        docker stop "$containers"
+        docker rm -f "$containers"
+      fi
+      docker rmi -f "$image"
+      rm -f "$id_path"
+    fi
+  done
 done
