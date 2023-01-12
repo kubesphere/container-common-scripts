@@ -1,20 +1,55 @@
+# shellcheck shell=bash
 #
 # Test a container image.
 #
-# Always use sourced from a specific container testfile 
+# Always use sourced from a specific container testfile
 #
-# reguires definition of CID_FILE_DIR
-# CID_FILE_DIR=$(mktemp --suffix=<container>_test_cidfiles -d)
-# reguires definition of TEST_LIST 
-# TEST_LIST="\
-# ctest_container_creation
-# ctest_doc_content"
 
 # Container CI tests
 # abbreviated as "ct"
 
+# run ct_init before starting the actual testsuite
+
+# shellcheck disable=SC2148
+if [ -z "${sourced_test_lib:-}" ]; then
+  sourced_test_lib=1
+else
+  return 0
+fi
+
 # may be redefined in the specific container testfile
 EXPECTED_EXIT_CODE=0
+
+# define UNSTABLE_TESTS if not already defined, as this variable
+# is not mandatory for containers
+UNSTABLE_TESTS="${UNSTABLE_TESTS:-""}"
+
+# following lines are added only for preserving backwards compatibility
+# and can be removed, when PR #306 is fully integrated to all container
+# repositories.
+TESTSUITE_RESULT=0
+APP_ID_FILE_DIR="/tmp/APP_ID_FILE_DIR_$RANDOM"
+# when removing this remove also all these lines:
+# mkdir -p "${APP_ID_FILE_DIR:?}"
+# as the $APP_ID_FILE_DIR should be created only in the ct_init function
+# ---------------------------------------------------------------------
+
+
+# ct_init
+# --------------------
+# This function needs to be called before any container test starts
+# Sets: $APP_ID_FILE_DIR - path to directory used for storing
+# IDs of application images used during tests.
+# Sets: $CID_FILE_DIR - path to directory containing cid_files
+# Sets: $TEST_SUMMARY - string, where test results are written
+# Sets: $TESTSUITE_RESULT - overall result of run testuite
+function ct_init() {
+  APP_ID_FILE_DIR="$(mktemp -d)"
+  CID_FILE_DIR="$(mktemp -d)"
+  TEST_SUMMARY=""
+  TESTSUITE_RESULT=0
+  ct_enable_cleanup
+}
 
 # ct_cleanup
 # --------------------
@@ -23,22 +58,110 @@ EXPECTED_EXIT_CODE=0
 # unexpectedly. Removes the cid_files and CID_FILE_DIR as well.
 # Uses: $CID_FILE_DIR - path to directory containing cid_files
 # Uses: $EXPECTED_EXIT_CODE - expected container exit code
+# Uses: $TESTSUITE_RESULT - overall result of all tests
 function ct_cleanup() {
-  for cid_file in $CID_FILE_DIR/* ; do
-    local container=$(cat $cid_file)
+  ct_show_resources
+  ct_show_results
+  ct_clean_app_images
 
-    : "Stopping and removing container $container..."
-    docker stop $container
-    exit_status=$(docker inspect -f '{{.State.ExitCode}}' $container)
-    if [ "$exit_status" != "$EXPECTED_EXIT_CODE" ]; then
-      : "Dumping logs for $container"
-      docker logs $container
+  if [[ -z ${CID_FILE_DIR:-} ]]; then
+    echo "The \$CID_FILE_DIR is not set. Container cleaning is to be skipped."
+    exit "${TESTSUITE_RESULT:-0}"
+  fi;
+
+  echo "Examining CID files in \$CID_FILE_DIR=$CID_FILE_DIR"
+  for cid_file in "$CID_FILE_DIR"/* ; do
+    [ -f "$cid_file" ] || continue
+    local container
+    container=$(cat "$cid_file")
+    rm "$cid_file"
+
+    ct_container_exists "$container" || continue
+
+    echo "Stopping and removing container $container..."
+    if ct_container_running "$container"; then
+      docker stop "$container"
     fi
-    docker rm -v $container
-    rm $cid_file
+
+    exit_status=$(docker inspect -f '{{.State.ExitCode}}' "$container")
+    if [ "$exit_status" != "$EXPECTED_EXIT_CODE" ]; then
+      echo "Dumping logs for $container"
+      docker logs "$container"
+    fi
+    docker rm -v "$container"
   done
-  rmdir $CID_FILE_DIR
-  : "Done."
+
+  rmdir "$CID_FILE_DIR"
+  exit "${TESTSUITE_RESULT:-0}"
+}
+
+# ct_container_running
+# --------------------
+# Return 0 if given container is in running state
+# Uses: $1 - container id to check
+function ct_container_running() {
+  local running
+  running="$(docker inspect -f '{{.State.Running}}' "$1")"
+  [ "$running" = "true" ] || return 1
+}
+
+# ct_container_exists
+# --------------------
+# Return 0 if given container exists
+# Uses: $1 - container id to check
+function ct_container_exists() {
+  local exists
+  exists="$(docker ps -q -f "id=$1")"
+  [ -n "$exists" ] || return 1
+}
+
+# ct_clean_app_images
+# --------------------
+# Cleans up application images referenced by APP_ID_FILE_DIR
+# Uses: $APP_ID_FILE_DIR - path to directory containing cid_files
+function ct_clean_app_images() {
+  local image
+  if [[ ! -d "${APP_ID_FILE_DIR:-}" ]]; then
+    echo "The \$APP_ID_FILE_DIR=$APP_ID_FILE_DIR is not created. App cleaning is to be skipped."
+    return 0
+  fi;
+  echo "Examining image ID files in \$APP_ID_FILE_DIR=$APP_ID_FILE_DIR"
+  for file in "${APP_ID_FILE_DIR:?}"/*; do
+    image="$(cat "$file")"
+    docker inspect "$image" > /dev/null 2>&1 || continue
+    containers="$(docker ps -q -a -f ancestor="$image")"
+    [[ -z "$containers" ]] || docker rm -f "$containers" 2>/dev/null
+    docker rmi -f "$image"
+  done
+  rm -fr "$APP_ID_FILE_DIR"
+}
+
+# ct_show_results
+# ---------------
+# Prints results of all test cases that are stored into TEST_SUMMARY variable.
+# Uses: $IMAGE_NAME - name of the tested container image
+# Uses: $TEST_SUMMARY - text info about test-cases
+# Uses: $TESTSUITE_RESULT - overall result of all tests
+function ct_show_results() {
+  # shellcheck disable=SC2153
+  echo "Tests were run for image ${IMAGE_NAME}"
+  echo "Uncompressed size of the image: $(ct_get_image_size_uncompresseed "${IMAGE_NAME}")"
+  echo "Compressed size of the image: $(ct_get_image_size_compresseed "${IMAGE_NAME}")"
+  echo
+  echo "==============================================="
+  echo "Test cases results:"
+  echo
+  echo "${TEST_SUMMARY:-}"
+
+  if [ -n "${TESTSUITE_RESULT:-}" ] ; then
+    if [ "$TESTSUITE_RESULT" -eq 0 ] ; then
+      # shellcheck disable=SC2153
+      echo "Tests for ${IMAGE_NAME} succeeded."
+    else
+      # shellcheck disable=SC2153
+      echo "Tests for ${IMAGE_NAME} failed."
+    fi
+  fi
 }
 
 # ct_enable_cleanup
@@ -48,6 +171,91 @@ function ct_enable_cleanup() {
   trap ct_cleanup EXIT SIGINT
 }
 
+# ct_pull_image
+# -------------
+# Function pull an image before tests execution
+# Argument: image_name - string containing the public name of the image to pull
+# Argument: exit - in case "true" is defined and pull failed, then script has to exit with 1 and no tests are executed
+# Argument: loops - how many times to pull image in case of failure
+# Function returns either 0 in case of pull was successful
+# Or the test suite exit with 1 in case of pull error
+function ct_pull_image() {
+  local image_name="$1"; [[ $# -gt 0 ]] && shift
+  local exit_variable=${1:-"false"}; [[ $# -gt 0 ]] && shift
+  local loops=${1:-10}
+  local loop=0
+
+  # Let's try to pull image.
+  echo "-> Pulling image $image_name ..."
+  # Sometimes in Fedora case it fails with HTTP 50X
+  # Check if the image is available locally and try to pull it if it is not
+  if [[ "$(docker images -q "$image_name" 2>/dev/null)" != "" ]]; then
+    echo "The image $image_name is already pulled."
+    return 0
+  fi
+
+  # Try pulling the image to see if it is accessible
+  # WORKAROUND: Since Fedora registry sometimes fails randomly, let's try it more times
+  while ! docker pull "$image_name"; do
+    ((loop++)) || :
+    echo "Pulling image $image_name failed."
+    if [ "$loop" -gt "$loops" ]; then
+      echo "Pulling of image $image_name failed $loops times in a row. Giving up."
+      echo "!!! ERROR with pulling image $image_name !!!!"
+      # shellcheck disable=SC2268
+      if [[ x"$exit_variable" == x"false" ]]; then
+        return 1
+      else
+        exit 1
+      fi
+    fi
+    echo "Let's wait $((loop*5)) seconds and try again."
+    sleep "$((loop*5))"
+  done
+}
+
+
+# ct_check_envs_set env_filter check_envs loop_envs [env_format]
+# --------------------
+# Compares values from one list of environment variable definitions against such list,
+# checking if the values are present and have a specific format.
+# Argument: env_filter - optional string passed to grep used for
+#   choosing which variables to filter out in env var lists.
+# Argument: check_envs - list of env var definitions to check values against
+# Argument: loop_envs - list of env var definitions to check values for
+# Argument: env_format (optional) - format string for bash substring deletion used
+#   for checking whether the value is contained in check_envs.
+#   Defaults to: "*VALUE*", VALUE string gets replaced by actual value from loop_envs
+function ct_check_envs_set {
+  local env_filter check_envs env_format
+  env_filter=$1; shift
+  check_envs=$1; shift
+  loop_envs=$1; shift
+  env_format=${1:-"*VALUE*"}
+  while read -r variable; do
+    [ -z "$variable" ] && continue
+    var_name=$(echo "$variable" | awk -F= '{ print $1 }')
+    stripped=$(echo "$variable" | awk -F= '{ print $2 }')
+    filtered_envs=$(echo "$check_envs" | grep "^$var_name=")
+    [ -z "$filtered_envs" ] && { echo "$var_name not found during \` docker exec\`"; return 1; }
+    old_IFS=$IFS
+    # For each such variable compare its content with the `docker exec` result, use `:` as delimiter
+    IFS=:
+    for value in $stripped; do
+        # If the falue checked does not go through env_filter we do not care about it
+        echo "$value" | grep -q "$env_filter" || continue
+        # shellcheck disable=SC2295
+        if [ -n "${filtered_envs##${env_format//VALUE/$value}}" ]; then
+            echo " Value $value is missing from variable $var_name"
+            echo "$filtered_envs"
+            IFS=$old_IFS
+            return 1
+        fi
+    done
+    IFS=$old_IFS
+  done <<< "$(echo "$loop_envs" | grep "$env_filter" | grep -v "^PWD=")"
+}
+
 # ct_get_cid [name]
 # --------------------
 # Prints container id from cid_file based on the name of the file.
@@ -55,7 +263,7 @@ function ct_enable_cleanup() {
 # Uses: $CID_FILE_DIR - path to directory containing cid_files
 function ct_get_cid() {
   local name="$1" ; shift || return 1
-  echo $(cat "$CID_FILE_DIR/$name")
+  cat "$CID_FILE_DIR/$name"
 }
 
 # ct_get_cip [id]
@@ -64,7 +272,7 @@ function ct_get_cid() {
 # Argument: id - container id
 function ct_get_cip() {
   local id="$1" ; shift
-  docker inspect --format='{{.NetworkSettings.IPAddress}}' $(ct_get_cid "$id")
+  docker inspect --format='{{.NetworkSettings.IPAddress}}' "$(ct_get_cid "$id")"
 }
 
 # ct_wait_for_cid [cid_file]
@@ -79,9 +287,9 @@ function ct_wait_for_cid() {
   local attempt=1
   local result=1
   while [ $attempt -le $max_attempts ]; do
-    [ -f $cid_file ] && [ -s $cid_file ] && return 0
-    : "Waiting for container start..."
-    attempt=$(( $attempt + 1 ))
+    [ -f "$cid_file" ] && [ -s "$cid_file" ] && return 0
+    echo "Waiting for container start... $attempt"
+    attempt=$(( attempt + 1 ))
     sleep $sleep_time
   done
   return 1
@@ -100,30 +308,32 @@ function ct_assert_container_creation_fails() {
   local cid_file=assert
   set +e
   local old_container_args="${CONTAINER_ARGS-}"
+  # we really work with CONTAINER_ARGS as with a string
+  # shellcheck disable=SC2124
   CONTAINER_ARGS="$@"
-  ct_create_container $cid_file
-  if [ $? -eq 0 ]; then
-    local cid=$(ct_get_cid $cid_file)
+  if ct_create_container "$cid_file" ; then
+    local cid
+    cid=$(ct_get_cid "$cid_file")
 
-    while [ "$(docker inspect -f '{{.State.Running}}' $cid)" == "true" ] ; do
+    while [ "$(docker inspect -f '{{.State.Running}}' "$cid")" == "true" ] ; do
       sleep 2
-      attempt=$(( $attempt + 1 ))
-      if [ $attempt -gt $max_attempts ]; then
-        docker stop $cid
+      attempt=$(( attempt + 1 ))
+      if [ "$attempt" -gt "$max_attempts" ]; then
+        docker stop "$cid"
         ret=1
         break
       fi
     done
-    exit_status=$(docker inspect -f '{{.State.ExitCode}}' $cid)
+    exit_status=$(docker inspect -f '{{.State.ExitCode}}' "$cid")
     if [ "$exit_status" == "0" ]; then
       ret=1
     fi
-    docker rm -v $cid
-    rm $CID_FILE_DIR/$cid_file
+    docker rm -v "$cid"
+    rm "$CID_FILE_DIR/$cid_file"
   fi
-  [ ! -z $old_container_args ] && CONTAINER_ARGS="$old_container_args"
+  [ -n "$old_container_args" ] && CONTAINER_ARGS="$old_container_args"
   set -e
-  return $ret
+  return "$ret"
 }
 
 # ct_create_container [name, command]
@@ -139,9 +349,10 @@ function ct_assert_container_creation_fails() {
 function ct_create_container() {
   local cid_file="$CID_FILE_DIR/$1" ; shift
   # create container with a cidfile in a directory for cleanup
-  docker run --cidfile="$cid_file" -d ${CONTAINER_ARGS:-} $IMAGE_NAME "$@"
-  ct_wait_for_cid $cid_file || return 1
-  : "Created container $(cat $cid_file)"
+  # shellcheck disable=SC2086,SC2153
+  docker run --cidfile="$cid_file" -d ${CONTAINER_ARGS:-} "$IMAGE_NAME" "$@"
+  ct_wait_for_cid "$cid_file" || return 1
+  : "Created container $(cat "$cid_file")"
 }
 
 # ct_scl_usage_old [name, command, expected]
@@ -159,19 +370,19 @@ function ct_scl_usage_old() {
   local expected="$3"
   local out=""
   : "  Testing the image SCL enable"
-  out=$(docker run --rm ${IMAGE_NAME} /bin/bash -c "${command}")
+  out=$(docker run --rm "${IMAGE_NAME}" /bin/bash -c "${command}")
   if ! echo "${out}" | grep -q "${expected}"; then
-    echo "ERROR[/bin/bash -c "${command}"] Expected '${expected}', got '${out}'" >&2
+    echo "ERROR[/bin/bash -c \"${command}\"] Expected '${expected}', got '${out}'" >&2
     return 1
   fi
-  out=$(docker exec $(ct_get_cid $name) /bin/bash -c "${command}" 2>&1)
+  out=$(docker exec "$(ct_get_cid "$name")" /bin/bash -c "${command}" 2>&1)
   if ! echo "${out}" | grep -q "${expected}"; then
-    echo "ERROR[exec /bin/bash -c "${command}"] Expected '${expected}', got '${out}'" >&2
+    echo "ERROR[exec /bin/bash -c \"${command}\"] Expected '${expected}', got '${out}'" >&2
     return 1
   fi
-  out=$(docker exec $(ct_get_cid $name) /bin/sh -ic "${command}" 2>&1)
+  out=$(docker exec "$(ct_get_cid "$name")" /bin/sh -ic "${command}" 2>&1)
   if ! echo "${out}" | grep -q "${expected}"; then
-    echo "ERROR[exec /bin/sh -ic "${command}"] Expected '${expected}', got '${out}'" >&2
+    echo "ERROR[exec /bin/sh -ic \"${command}\"] Expected '${expected}', got '${out}'" >&2
     return 1
   fi
 }
@@ -183,22 +394,24 @@ function ct_scl_usage_old() {
 # Argument: strings - strings expected to appear in the documentation
 # Uses: $IMAGE_NAME - name of the image being tested
 function ct_doc_content_old() {
-  local tmpdir=$(mktemp -d)
+  local tmpdir
+  tmpdir=$(mktemp -d)
   local f
   : "  Testing documentation in the container image"
   # Extract the help files from the container
+  # shellcheck disable=SC2043
   for f in help.1 ; do
-    docker run --rm ${IMAGE_NAME} /bin/bash -c "cat /${f}" >${tmpdir}/$(basename ${f})
+    docker run --rm "${IMAGE_NAME}" /bin/bash -c "cat /${f}" >"${tmpdir}/$(basename "${f}")"
     # Check whether the files contain some important information
-    for term in $@ ; do
-      if ! cat ${tmpdir}/$(basename ${f}) | grep -F -q -e "${term}" ; then
+    for term in "$@" ; do
+      if ! grep -E -q -e "${term}" "${tmpdir}/$(basename "${f}")" ; then
         echo "ERROR: File /${f} does not include '${term}'." >&2
         return 1
       fi
     done
     # Check whether the files use the correct format
     for term in TH PP SH ; do
-      if ! grep -q "^\.${term}" ${tmpdir}/help.1 ; then
+      if ! grep -q "^\.${term}" "${tmpdir}/help.1" ; then
         echo "ERROR: /help.1 is probably not in troff or groff format, since '${term}' is missing." >&2
         return 1
       fi
@@ -207,29 +420,165 @@ function ct_doc_content_old() {
   : "  Success!"
 }
 
+# full_ca_file_path
+# Return string for full path to CA file
+function full_ca_file_path()
+{
+  echo "/etc/pki/ca-trust/source/anchors/RH-IT-Root-CA.crt"
+}
+# ct_mount_ca_file
+# ------------------
+# Check if /etc/pki/certs/RH-IT-Root-CA.crt file exists
+# return mount string for containers or empty string
+function ct_mount_ca_file()
+{
+  # mount CA file only if NPM_REGISTRY variable is present.
+  local mount_parameter=""
+  if [ -n "$NPM_REGISTRY" ] && [ -f "$(full_ca_file_path)" ]; then
+    mount_parameter="-v $(full_ca_file_path):$(full_ca_file_path):Z"
+  fi
+  echo "$mount_parameter"
+}
+
+# ct_build_s2i_npm_variables URL_TO_NPM_JS_SERVER
+# ------------------------------------------
+# Function returns -e NPM_MIRROR and -v MOUNT_POINT_FOR_CAFILE
+# or empty string
+function ct_build_s2i_npm_variables()
+{
+  npm_variables=""
+  if [ -n "$NPM_REGISTRY" ] && [ -f "$(full_ca_file_path)" ]; then
+    npm_variables="-e NPM_MIRROR=$NPM_REGISTRY $(ct_mount_ca_file)"
+  fi
+  echo "$npm_variables"
+}
 
 # ct_npm_works
 # --------------------
 # Checks existance of the npm tool and runs it.
 function ct_npm_works() {
-  local tmpdir=$(mktemp -d)
+  local tmpdir
+  tmpdir=$(mktemp -d)
   : "  Testing npm in the container image"
-  docker run --rm ${IMAGE_NAME} /bin/bash -c "npm --version" >${tmpdir}/version
-
-  if [ $? -ne 0 ] ; then
+  local cid_file="${tmpdir}/cid"
+  if ! docker run --rm "${IMAGE_NAME}" /bin/bash -c "npm --version" >"${tmpdir}/version" ; then
     echo "ERROR: 'npm --version' does not work inside the image ${IMAGE_NAME}." >&2
     return 1
   fi
 
-  docker run --rm ${IMAGE_NAME} /bin/bash -c "npm install jquery && test -f node_modules/jquery/src/jquery.js"
-  if [ $? -ne 0 ] ; then
+  # shellcheck disable=SC2046
+  docker run -d $(ct_mount_ca_file) --rm --cidfile="$cid_file" "${IMAGE_NAME}-testapp"
+
+  # Wait for the container to write it's CID file
+  ct_wait_for_cid "$cid_file" || return 1
+
+  if ! docker exec "$(cat "$cid_file")" /bin/bash -c "npm --verbose install jquery && test -f node_modules/jquery/src/jquery.js" >"${tmpdir}/jquery" 2>&1 ; then
     echo "ERROR: npm could not install jquery inside the image ${IMAGE_NAME}." >&2
+    cat "${tmpdir}/jquery"
     return 1
   fi
 
+  if [ -n "$NPM_REGISTRY" ] && [ -f "$(full_ca_file_path)" ]; then
+    if ! grep -qo "$NPM_REGISTRY" "${tmpdir}/jquery"; then
+        echo "ERROR: Internal repository is NOT set. Even it is requested."
+        return 1
+    fi
+  fi
+
+  if [ -f "$cid_file" ]; then
+      docker stop "$(cat "$cid_file")"
+      rm "$cid_file"
+  fi
   : "  Success!"
 }
 
+# ct_binary_found_from_df binary [path]
+# --------------------
+# Checks if a binary can be found in PATH during Dockerfile build
+# Argument: binary - name of the binary to test accessibility for
+# Argument: path - optional path in which the binary should reside in
+#                  /opt/rh by default
+function ct_binary_found_from_df() {
+  local tmpdir
+  local binary=$1; shift
+  local binary_path=${1:-"^/opt/rh"}
+  tmpdir=$(mktemp -d)
+  : "  Testing $binary in build from Dockerfile"
+
+  # Create Dockerfile that looks for the binary
+  cat <<EOF >"$tmpdir/Dockerfile"
+FROM $IMAGE_NAME
+RUN command -v $binary | grep "$binary_path"
+EOF
+  # Build an image, looking for expected path in the output
+  local id_file
+  mkdir -p "${APP_ID_FILE_DIR:?}"
+  id_file="${APP_ID_FILE_DIR:?}"/"$RANDOM"
+  if ! docker build -f "$tmpdir/Dockerfile" --no-cache "$tmpdir" --iidfile "$id_file"; then
+    echo "  ERROR: Failed to find $binary in Dockerfile!" >&2
+    return 1
+  fi
+  : "  Success!"
+}
+
+# ct_check_exec_env_vars [env_filter]
+# --------------------
+# Checks if all relevant environment variables from `docker run`
+# can be found in `docker exec` as well.
+# Argument: env_filter - optional string passed to grep used for
+#   choosing which variables to check in the test case.
+#   Defaults to X_SCLS and variables containing /opt/app-root, /opt/rh
+# Uses: $CID_FILE_DIR - path to directory containing cid_files
+# Uses: $IMAGE_NAME - name of the image being tested
+function ct_check_exec_env_vars() {
+  local tmpdir exec_envs cid old_IFS env_filter
+  local var_name stripped filtered_envs run_envs
+  env_filter=${1:-"^X_SCLS=\|/opt/rh\|/opt/app-root"}
+  tmpdir=$(mktemp -d)
+  CID_FILE_DIR=${CID_FILE_DIR:-$(mktemp -d)}
+  # Get environment variables from `docker run`
+  run_envs=$(docker run --rm "$IMAGE_NAME" /bin/bash -c "env")
+  # Get environment variables from `docker exec`
+  ct_create_container "test_exec_envs" bash -c "sleep 1000" >/dev/null
+  cid=$(ct_get_cid "test_exec_envs")
+  exec_envs=$(docker exec "$cid" env)
+  # Filter out variables we are not interested in
+  # Always check X_SCLS, ignore PWD
+  # Check variables from `docker run` that have alternative paths inside (/opt/rh, /opt/app-root)
+  ct_check_envs_set "$env_filter" "$exec_envs" "$run_envs" "*VALUE*" || return 1
+  echo " All values present in \`docker exec\`"
+  return 0
+}
+
+# ct_check_scl_enable_vars [env_filter]
+# --------------------
+# Checks if all relevant environment variables from `docker run`
+# are set twice after a second call of `scl enable $SCLS`.
+# Argument: env_filter - optional string passed to grep used for
+#   choosing which variables to check in the test case.
+#   Defaults to paths containing enabled SCLS in the image
+# Uses: $IMAGE_NAME - name of the image being tested
+function ct_check_scl_enable_vars() {
+  local tmpdir exec_envs cid old_IFS env_filter enabled_scls
+  local var_name stripped filtered_envs loop_envs
+  env_filter=$1
+  tmpdir=$(mktemp -d)
+  enabled_scls=$(docker run --rm "$IMAGE_NAME" /bin/bash -c "echo \$X_SCLS")
+  if [ -z "$env_filter" ]; then
+    for scl in $enabled_scls; do
+      [ -z "$env_filter" ] && env_filter="/$scl" && continue
+      # env_filter not empty, append to the existing list
+      env_filter="$env_filter|/$scl"
+    done
+  fi
+  # Get environment variables from `docker run`
+  loop_envs=$(docker run --rm "$IMAGE_NAME" /bin/bash -c "env")
+  run_envs=$(docker run  --rm "$IMAGE_NAME" /bin/bash -c "X_SCLS= scl enable $enabled_scls env")
+  # Check if the values are set twice in the second set of envs
+  ct_check_envs_set "$env_filter" "$run_envs" "$loop_envs" "*VALUE*VALUE*" || return 1
+  echo " All scl_enable values present"
+  return 0
+}
 
 # ct_path_append PATH_VARNAME DIRECTORY
 # -------------------------------------
@@ -263,19 +612,6 @@ ct_path_foreach ()
 }
 
 
-# ct_run_test_list
-# --------------------
-# Execute the tests specified by TEST_LIST
-# Uses: $TEST_LIST - list of test names
-function ct_run_test_list() {
-  for test_case in $TEST_LIST; do
-    : "Running test $test_case"
-    [ -f test/$test_case ] && source test/$test_case
-    [ -f ../test/$test_case ] && source ../test/$test_case
-    $test_case
-  done;
-}
-
 # ct_gen_self_signed_cert_pem
 # ---------------------------
 # Generates a self-signed PEM certificate pair into specified directory.
@@ -287,9 +623,9 @@ function ct_run_test_list() {
 ct_gen_self_signed_cert_pem() {
   local output_dir=$1 ; shift
   local base_name=$1 ; shift
-  mkdir -p ${output_dir}
-  openssl req -newkey rsa:2048 -nodes -keyout ${output_dir}/${base_name}-key.pem -subj '/C=GB/ST=Berkshire/L=Newbury/O=My Server Company' > ${base_name}-req.pem
-  openssl req -new -x509 -nodes -key ${output_dir}/${base_name}-key.pem -batch > ${output_dir}/${base_name}-cert-selfsigned.pem
+  mkdir -p "${output_dir}"
+  openssl req -newkey rsa:2048 -nodes -keyout "${output_dir}"/"${base_name}"-key.pem -subj '/C=GB/ST=Berkshire/L=Newbury/O=My Server Company' > "${base_name}"-req.pem
+  openssl req -new -x509 -nodes -key "${output_dir}"/"${base_name}"-key.pem -batch > "${output_dir}"/"${base_name}"-cert-selfsigned.pem
 }
 
 # ct_obtain_input FILE|DIR|URL
@@ -305,7 +641,8 @@ function ct_obtain_input() {
   # Try to use same extension for the temporary file if possible
   [[ "${extension}" =~ ^[a-z0-9]*$ ]] && extension=".${extension}" || extension=""
 
-  local output=$(mktemp "/var/tmp/test-input-XXXXXX$extension")
+  local output
+  output=$(mktemp "/var/tmp/test-input-XXXXXX$extension")
   if [ -f "${input}" ] ; then
     cp -f "${input}" "${output}"
   elif [ -d "${input}" ] ; then
@@ -336,33 +673,35 @@ ct_test_response() {
   local max_attempts=${4:-20}
   local ignore_error_attempts=${5:-10}
 
-  : "  Testing the HTTP(S) response for <${url}>"
+  echo "  Testing the HTTP(S) response for <${url}>"
   local sleep_time=3
   local attempt=1
   local result=1
   local status
   local response_code
-  local response_file=$(mktemp /tmp/ct_test_response_XXXXXX)
-  while [ ${attempt} -le ${max_attempts} ]; do
-    curl --connect-timeout 10 -s -w '%{http_code}' "${url}" >${response_file} && status=0 || status=1
-    if [ ${status} -eq 0 ]; then
-      response_code=$(cat ${response_file} | tail -c 3)
+  local response_file
+  response_file=$(mktemp /tmp/ct_test_response_XXXXXX)
+  while [ "${attempt}" -le "${max_attempts}" ]; do
+    echo "Trying to connect ... ${attempt}"
+    curl --connect-timeout 10 -s -w '%{http_code}' "${url}" >"${response_file}" && status=0 || status=1
+    if [ "${status}" -eq 0 ]; then
+      response_code=$(tail -c 3 "${response_file}")
       if [ "${response_code}" -eq "${expected_code}" ]; then
         result=0
       fi
-      cat ${response_file} | grep -qP -e "${body_regexp}" || result=1;
+      grep -qP -e "${body_regexp}" "${response_file}" || result=1;
       # Some services return 40x code until they are ready, so let's give them
       # some chance and not end with failure right away
       # Do not wait if we already have expected outcome though
-      if [ ${result} -eq 0 -o ${attempt} -gt ${ignore_error_attempts} -o ${attempt} -eq ${max_attempts} ] ; then
+      if [ "${result}" -eq 0 ] || [ "${attempt}" -gt "${ignore_error_attempts}" ] || [ "${attempt}" -eq "${max_attempts}" ] ; then
         break
       fi
     fi
-    attempt=$(( ${attempt} + 1 ))
-    sleep ${sleep_time}
+    attempt=$(( attempt + 1 ))
+    sleep "${sleep_time}"
   done
-  rm -f ${response_file}
-  return ${result}
+  rm -f "${response_file}"
+  return "${result}"
 }
 
 # ct_registry_from_os OS
@@ -373,13 +712,45 @@ ct_registry_from_os() {
   local registry=""
   case $1 in
     rhel*)
-        registry=registry.access.redhat.com
+        registry=registry.redhat.io
         ;;
     *)
-        registry=docker.io
+        registry=quay.io
         ;;
     esac
   echo "$registry"
+}
+
+ # ct_get_public_image_name OS BASE_IMAGE_NAME VERSION
+# ----------------
+# Transform the arguments into public image name
+# Argument: OS - string containing the os version
+# Argument: BASE_IMAGE_NAME - string containing the base name of the image as defined in the Makefile
+# Argument: VERSION - string containing the version of the image as defined in the Makefile
+ct_get_public_image_name() {
+  local os=$1; shift
+  local base_image_name=$1; shift
+  local version=$1; shift
+
+  local public_image_name
+  local registry
+
+  registry=$(ct_registry_from_os "$os")
+  if [ "$os" == "rhel7" ]; then
+    public_image_name=$registry/rhscl/$base_image_name-${version//./}-rhel7
+  elif [ "$os" == "rhel8" ]; then
+    public_image_name=$registry/rhel8/$base_image_name-${version//./}
+  elif [ "$os" == "rhel9" ]; then
+    public_image_name=$registry/rhel9/$base_image_name-${version//./}
+  elif [ "$os" == "centos7" ]; then
+    public_image_name=$registry/centos7/$base_image_name-${version//./}-centos7
+  elif [ "$os" == "c8s" ]; then
+    public_image_name=$registry/sclorg/$base_image_name-${version//./}-c8s
+  elif [ "$os" == "c9s" ]; then
+    public_image_name=$registry/sclorg/$base_image_name-${version//./}-c9s
+  fi
+
+  echo "$public_image_name"
 }
 
 # ct_assert_cmd_success CMD
@@ -388,6 +759,7 @@ ct_registry_from_os() {
 # Argument: CMD - Command to be run
 function ct_assert_cmd_success() {
   echo "Checking '$*' for success ..."
+  # shellcheck disable=SC2294
   if ! eval "$@" &>/dev/null; then
     echo " FAIL"
     return 1
@@ -402,6 +774,7 @@ function ct_assert_cmd_success() {
 # Argument: CMD - Command to be run
 function ct_assert_cmd_failure() {
   echo "Checking '$*' for failure ..."
+  # shellcheck disable=SC2294
   if eval "$@" &>/dev/null; then
     echo " FAIL"
     return 1
@@ -456,13 +829,41 @@ ct_s2i_build_as_df()
     local user_id=
     local df_name=
     local tmpdir=
+    local incremental=false
+    local mount_options=()
+
+    # Run the entire thing inside a subshell so that we do not leak shell options outside of the function
+    (
+    # Error out if any part of the build fails
+    set -e
+
     # Use /tmp to not pollute cwd
     tmpdir=$(mktemp -d)
     df_name=$(mktemp -p "$tmpdir" Dockerfile.XXXX)
-    pushd "$tmpdir"
+    cd "$tmpdir"
     # Check if the image is available locally and try to pull it if it is not
     docker images "$src_image" &>/dev/null || echo "$s2i_args" | grep -q "pull-policy=never" || docker pull "$src_image"
-    user_id=$(docker inspect -f "{{.Config.User}}" "$src_image")
+    user=$(docker inspect -f "{{.Config.User}}" "$src_image")
+    # Default to root if no user is set by the image
+    user=${user:-0}
+    # run the user through the image in case it is non-numeric or does not exist
+    if ! user_id=$(ct_get_uid_from_image "$user" "$src_image"); then
+        echo "Terminating s2i build."
+        return 1
+    fi
+
+    echo "$s2i_args" | grep -q "\-\-incremental" && incremental=true
+    if $incremental; then
+        inc_tmp=$(mktemp -d --tmpdir incremental.XXXX)
+        setfacl -m "u:$user_id:rwx" "$inc_tmp"
+        # Check if the image exists, build should fail (for testing use case) if it does not
+        docker images "$dst_image" &>/dev/null || (echo "Image $dst_image not found."; false)
+        # Run the original image with a mounted in volume and get the artifacts out of it
+        cmd="if [ -s /usr/libexec/s2i/save-artifacts ]; then /usr/libexec/s2i/save-artifacts > \"$inc_tmp/artifacts.tar\"; else touch \"$inc_tmp/artifacts.tar\"; fi"
+        docker run --rm -v "$inc_tmp:$inc_tmp:Z" "$dst_image" bash -c "$cmd"
+        # Move the created content into the $tmpdir for the build to pick it up
+        mv "$inc_tmp/artifacts.tar" "$tmpdir/"
+    fi
     # Strip file:// from APP_PATH and copy its contents into current context
     mkdir -p "$local_app"
     cp -r "${app_path/file:\/\//}/." "$local_app"
@@ -488,6 +889,16 @@ EOF
     fi
     # Filter out env var definitions from $s2i_args and create Dockerfile ENV commands out of them
     echo "$s2i_args" | grep -o -e '\(-e\|--env\)[[:space:]=]\S*=\S*' | sed -e 's/-e /ENV /' -e 's/--env[ =]/ENV /' >>"$df_name"
+    # Check if CA autority is present on host and add it into Dockerfile
+    [ -f "$(full_ca_file_path)" ] && echo "RUN cd /etc/pki/ca-trust/source/anchors && update-ca-trust extract" >>"$df_name"
+
+    # Add in artifacts if doing an incremental build
+    if $incremental; then
+        { echo "RUN mkdir /tmp/artifacts"
+          echo "ADD artifacts.tar /tmp/artifacts"
+          echo "RUN chown -R $user_id:0 /tmp/artifacts" ; } >>"$df_name"
+    fi
+
     echo "USER $user_id" >>"$df_name"
     # If exists, run the custom assemble script, else default to /usr/libexec/s2i/assemble
     if [ -x "$local_scripts/assemble" ]; then
@@ -501,9 +912,417 @@ EOF
     else
         echo "CMD /usr/libexec/s2i/run" >>"$df_name"
     fi
+
+    # Check if -v parameter is present in s2i_args and add it into docker build command
+    read -ra mount_options <<< "$(echo "$s2i_args" | grep -o -e '\(-v\)[[:space:]]\.*\S*' || true)"
+
     # Run the build and tag the result
-    docker build -f "$df_name" -t "$dst_image" .
-    popd
+    local id_file
+    mkdir -p "${APP_ID_FILE_DIR:?}"
+    id_file="${APP_ID_FILE_DIR:?}"/"$RANDOM"
+    docker build ${mount_options[@]+"${mount_options[@]}"} --iidfile="$id_file" -f "$df_name" --no-cache=true -t "$dst_image" .
+    )
+}
+
+# ct_s2i_multistage_build APP_PATH SRC_IMAGE DST_IMAGE SEC_IMAGE [S2I_ARGS]
+# ----------------------------
+# Create a new s2i app image from local sources in a similar way as source-to-image would have used.
+# Argument: APP_PATH - local path to the app sources to be used in the test
+# Argument: SRC_IMAGE - image to be used as a base for the s2i build process
+# Argument: SEC_IMAGE - image to be used as the base for the result of the build process
+# Argument: DST_IMAGE - image name to be used during the tagging of the s2i build result
+# Argument: S2I_ARGS - Additional list of source-to-image arguments.
+#                      Only used to check for environment variable definitions.
+ct_s2i_multistage_build() {
+
+  local app_path=$1; shift
+  local src_image=$1; shift
+  local sec_image=$1; shift
+  local dst_image=$1; shift
+  local s2i_args=$*;
+  local local_app="app-src"
+  local user_id=
+  local mount_options=()
+
+
+  # Run the entire thing inside a subshell so that we do not leak shell options outside of the function
+  (
+  # Error out if any part of the build fails
+  set -e
+
+  user=$(docker inspect -f "{{.Config.User}}" "$src_image")
+  # Default to root if no user is set by the image
+  user=${user:-0}
+  # run the user through the image in case it is non-numeric or does not exist
+  if ! user_id=$(ct_get_uid_from_image "$user" "$src_image"); then
+      echo "Terminating s2i build."
+      return 1
+  fi
+
+  # Use /tmp to not pollute cwd
+  tmpdir=$(mktemp -d)
+  df_name=$(mktemp -p "$tmpdir" Dockerfile.XXXX)
+  cd "$tmpdir"
+
+  # If the path exists on the local host, copy it into the directory for the build
+  # Otherwise handle it as a link to a git repository
+  if [ -e "${app_path/file:\/\//}/." ] ; then
+    mkdir -p "$local_app"
+    # Strip file:// from APP_PATH and copy its contents into current context
+    cp -r "${app_path/file:\/\//}/." "$local_app"
+
+  else
+    ct_clone_git_repository "$app_path" "$local_app"
+  fi
+
+  cat <<EOF >"$df_name"
+# First stage builds the application
+FROM $src_image as builder
+# Add application sources to a directory that the assemble script expects them
+# and set permissions so that the container runs without root access
+USER 0
+ADD app-src /tmp/src
+RUN chown -R 1001:0 /tmp/src
+$(echo "$s2i_args" | grep -o -e '\(-e\|--env\)[[:space:]=]\S*=\S*' | sed -e 's/-e /ENV /' -e 's/--env[ =]/ENV /')
+# Check if CA autority is present on host and add it into Dockerfile
+$([ -f "$(full_ca_file_path)" ] && echo "RUN cd /etc/pki/ca-trust/source/anchors && update-ca-trust extract")
+USER $user_id
+# Install the dependencies
+RUN /usr/libexec/s2i/assemble
+# Second stage copies the application to the minimal image
+FROM $sec_image
+# Copy the application source and build artifacts from the builder image to this one
+COPY --from=builder \$HOME \$HOME
+# Set the default command for the resulting image
+CMD /usr/libexec/s2i/run
+EOF
+
+  # Check if -v parameter is present in s2i_args and add it into docker build command
+  read -ra mount_options <<< "$(echo "$s2i_args" | grep -o -e '\(-v\)[[:space:]]\.*\S*' || true)"
+
+  local id_file
+  mkdir -p "${APP_ID_FILE_DIR:?}"
+  id_file="${APP_ID_FILE_DIR:?}"/"$RANDOM"
+  docker build ${mount_options[@]+"${mount_options[@]}"} -f "$df_name" --iidfile="$id_file" --no-cache=true -t "$dst_image" .
+  )
+}
+
+# ct_check_image_availability PUBLIC_IMAGE_NAME
+# ----------------------------
+# Pull an image from the public repositories to see if the image is already available.
+# Argument: PUBLIC_IMAGE_NAME - string containing the public name of the image to pull
+ct_check_image_availability() {
+  local public_image_name=$1;
+
+  # Try pulling the image to see if it is accessible
+  if ! ct_pull_image "$public_image_name" &>/dev/null; then
+    echo "$public_image_name could not be downloaded via 'docker'"
+    return 1
+  fi
+}
+
+# ct_check_latest_imagestreams
+# -----------------------------
+# Check if the latest version present in Makefile in the variable VERSIONS
+# is present in all imagestreams.
+# Also the latest tag in the imagestreams has to contain the latest version
+ct_check_latest_imagestreams() {
+    local latest_version=
+    local test_lib_dir=
+
+    # We only maintain imagestreams for RHEL and CentOS (Community)
+    if [[ "$OS" =~ ^fedora.* ]] ; then
+      echo "Imagestreams for Fedora are not maintained, skipping ct_check_latest_imagestreams"
+      return 0
+    fi
+
+    # Check only lines which starts with VERSIONS
+    latest_version=$(grep '^VERSIONS' Makefile | rev | cut -d ' ' -f 1 | rev )
+    # Fall back to previous version if the latest is excluded for this OS
+    [ -f "$latest_version/.exclude-$OS" ] && latest_version=$(grep '^VERSIONS' Makefile | rev | cut -d ' ' -f 2 | rev )
+    # Only test the imagestream once, when the version matches
+    # ignore the SC warning, $VERSION is always available
+    # shellcheck disable=SC2153
+    if [ "$latest_version" == "$VERSION" ]; then
+      test_lib_dir=$(dirname "$(readlink -f "$0")")
+      python3 "${test_lib_dir}/check_imagestreams.py" "$latest_version"
+    else
+      echo "Image version $VERSION is not latest, skipping ct_check_latest_imagestreams"
+    fi
+}
+
+# ct_show_resources
+# ----------------
+# Prints the available resources
+ct_show_resources()
+{
+  echo
+  echo "Resources info:"
+  echo "Memory:"
+  free -h
+  echo "Storage:"
+  df -h || :
+  echo "CPU"
+  lscpu
+}
+
+# ct_clone_git_repository
+# -----------------------------
+# Argument: app_url - git URI pointing to a repository, supports "@" to indicate a different branch
+# Argument: app_dir (optional) - name of the directory to clone the repository into
+ct_clone_git_repository()
+{
+  local app_url=$1; shift
+  local app_dir=$1
+
+  # If app_url contains @, the string after @ is considered
+  # as a name of a branch to clone instead of the main/master branch
+  IFS='@' read -ra git_url_parts <<< "${app_url}"
+
+  if [ -n "${git_url_parts[1]}" ]; then
+    git_clone_cmd="git clone --branch ${git_url_parts[1]} ${git_url_parts[0]} ${app_dir}"
+  else
+    git_clone_cmd="git clone ${app_url} ${app_dir}"
+  fi
+
+  if ! $git_clone_cmd ; then
+    echo "ERROR: Git repository ${app_url} cannot be cloned into ${app_dir}."
+    return 1
+  fi
+}
+
+# ct_get_uid_from_image
+# -----------------------------
+# Argument: user - user to get uid for inside the image
+# Argument: src_image - image to use for user information
+ct_get_uid_from_image()
+{
+  local user=$1; shift
+  local src_image=$1
+  local user_id=
+
+  # NOTE: The '-eq' test is used to check if $user is numeric as it will fail if $user is not an integer
+  if ! [ "$user" -eq "$user" ] 2>/dev/null && ! user_id=$(docker run --rm "$src_image" bash -c "id -u $user 2>/dev/null"); then
+      echo "ERROR: id of user $user not found inside image $src_image."
+      return 1
+  else
+      echo "${user_id:-$user}"
+  fi
+}
+
+# ct_test_app_dockerfile
+# -----------------------------
+# Argument: dockerfile - path to a Dockerfile that will be used for building an image
+#                        (must work with an application directory called 'app-src')
+# Argument: app_url - git or local URI with a testing application, supports "@" to indicate a different branch
+# Argument: body_regexp - PCRE regular expression that must match the response body
+# Argument: app_dir - name of the application directory that is used in the Dockerfile
+# Argument: port - Optional port number (default: 8080)
+ct_test_app_dockerfile() {
+  local dockerfile=$1
+  local app_url=$2
+  local expected_text=$3
+  local app_dir=$4 # this is a directory that must match with the name in the Dockerfile
+  local port=${5:-8080}
+  local app_image_name=myapp
+  local ret
+  local cname=app_dockerfile
+
+  if [ -z "$app_dir" ] ; then
+    echo "ERROR: Option app_dir not set. Terminating the Dockerfile build."
+    return 1
+  fi
+
+  if ! [ -r "${dockerfile}" ] || ! [ -s "${dockerfile}" ] ; then
+    echo "ERROR: Dockerfile ${dockerfile} does not exist or is empty."
+    echo "Terminating the Dockerfile build."
+    return 1
+  fi
+
+  CID_FILE_DIR=${CID_FILE_DIR:-$(mktemp -d)}
+  local dockerfile_abs
+  dockerfile_abs=$(readlink -f "${dockerfile}")
+  tmpdir=$(mktemp -d)
+  pushd "$tmpdir" >/dev/null
+  cp "${dockerfile_abs}" Dockerfile
+
+  # Rewrite the source image to what we test
+  sed -i -e "s|^FROM.*$|FROM $IMAGE_NAME|" Dockerfile
+  # a bit more verbose, but should help debugging failures
+  echo "Using this Dockerfile:"
+  cat Dockerfile
+
+  if [ -d "$app_url" ] ; then
+    echo "Copying local folder: $app_url -> $app_dir."
+    cp -Lr "$app_url" "$app_dir"
+  else
+    if ! ct_clone_git_repository "$app_url" "$app_dir" ; then
+      echo "Terminating the Dockerfile build."
+      return 1
+    fi
+  fi
+
+  echo "Building '${app_image_name}' image using docker build"
+  local id_file
+  mkdir -p "${APP_ID_FILE_DIR:?}"
+  id_file="${APP_ID_FILE_DIR:?}"/"$RANDOM"
+  if ! docker build --no-cache=true --iidfile="$id_file" -t "${app_image_name}" . ; then
+    echo "ERROR: The image cannot be built from ${dockerfile} and application ${app_url}."
+    echo "Terminating the Dockerfile build."
+    return 1
+  fi
+
+  if ! docker run -d --cidfile="${CID_FILE_DIR}/app_dockerfile" --rm "${app_image_name}"  ; then
+    echo "ERROR: The image ${app_image_name} cannot be run for ${dockerfile} and application ${app_url}."
+    echo "Terminating the Dockerfile build."
+    return 1
+  fi
+  echo "Waiting for ${app_image_name} to start"
+  ct_wait_for_cid "${CID_FILE_DIR}/app_dockerfile"
+
+  ip="$(ct_get_cip "${cname}")"
+  if [ -z "$ip" ]; then
+    echo "ERROR: Cannot get container's IP address."
+    return 1
+  fi
+  ct_test_response "http://$ip:${port}" 200 "${expected_text}"
+  ret=$?
+
+  [[ $ret -eq 0 ]] || docker logs "$(ct_get_cid "${cname}")"
+
+  # cleanup
+  docker kill "$(ct_get_cid "${cname}")"
+  sleep 2
+  docker rmi "${app_image_name}"
+  popd >/dev/null
+  rm -rf "${tmpdir}"
+  rm -f "${CID_FILE_DIR}/${cname}"
+  return $ret
+}
+
+# ct_check_testcase_result
+# -----------------------------
+# Check if testcase ended in success or error
+# Argument: result - testcase result value
+# Uses: $TESTCASE_RESULT - result of the testcase
+# Uses: $IMAGE_NAME - name of the image being tested
+ct_check_testcase_result() {
+  local result="$1"
+  if [[ "$result" != "0" ]]; then
+    echo "Test for image '${IMAGE_NAME}' FAILED (exit code: ${result})"
+    TESTCASE_RESULT=1
+  fi
+  return "$result"
+}
+
+# ct_run_tests_from_testset
+# -----------------------------
+# Runs all tests in $TEST_SET, prints result to
+# the $TEST_SUMMARY variable
+# Argument: app_name - application name to log
+# Uses: $TEST_SET - set of test cases to run
+# Uses: $TEST_SUMMARY - variable for storing test results
+# Uses: $IMAGE_NAME - name of the image being tested
+# Uses: $UNSTABLE_TESTS - set of tests, whose result can be ignored
+# Uses: $IGNORE_UNSTABLE_TESTS - flag to ignore unstable tests
+ct_run_tests_from_testset() {
+  local app_name="${1:-appnamenotset}"
+  local time_beg_pretty
+  local time_beg
+  local time_end
+  local time_diff
+  local test_msg
+  local is_unstable
+
+  # Let's store in the log what change do we test
+  echo
+  git show -s
+  echo
+
+  echo "Running tests for image ${IMAGE_NAME}"
+
+  for test_case in $TEST_SET; do
+    TESTCASE_RESULT=0
+    # shellcheck disable=SC2076
+    if [[ " ${UNSTABLE_TESTS[*]} " =~ " ${app_name} " ]] || \
+       [[ " ${UNSTABLE_TESTS[*]} " =~ " ${test_case} " ]]; then
+      is_unstable=1
+    else
+      is_unstable=0
+    fi
+    time_beg_pretty=$(ct_timestamp_pretty)
+    time_beg=$(ct_timestamp_s)
+    echo "-----------------------------------------------"
+    echo "Running test $test_case (starting at $time_beg_pretty) ... "
+    echo "-----------------------------------------------"
+    $test_case
+    ct_check_testcase_result $?
+    time_end=$(ct_timestamp_s)
+    if [ $TESTCASE_RESULT -eq 0 ]; then
+      test_msg="[PASSED]"
+    else
+      if [ -n "${IGNORE_UNSTABLE_TESTS:-""}" ] && [ $is_unstable -eq 1 ]; then
+        test_msg="[FAILED][UNSTABLE-IGNORED]"
+      else
+        test_msg="[FAILED]"
+        TESTSUITE_RESULT=1
+      fi
+    fi
+    time_diff=$(ct_timestamp_diff "$time_beg" "$time_end")
+    printf -v TEST_SUMMARY "%s %s for '%s' %s (%s)\n" "${TEST_SUMMARY:-}" "${test_msg}" "${app_name}" "$test_case" "$time_diff"
+    [ -n "${FAIL_QUICKLY:-}" ] && return 1
+  done
+}
+
+# ct_timestamp_s
+# --------------
+# Returns timestamp in seconds since unix era -- a large integer
+function ct_timestamp_s() {
+  date '+%s'
+}
+
+# ct_timestamp_pretty
+# -----------------
+# Returns timestamp readable to a human, like 2022-05-18 10:52:44+02:00
+function ct_timestamp_pretty() {
+  date --rfc-3339=seconds
+}
+
+# ct_timestamp_diff
+# -----------------
+# Computes a time diff between two timestamps
+# Argument: start_date - Beginning (in seconds since unix era -- a large integer)
+# Argument: final_date - End (in seconds since unix era -- a large integer)
+# Returns: Time difference in format HH:MM:SS
+function ct_timestamp_diff() {
+  local start_date=$1
+  local final_date=$2
+  date -u -d "0 $final_date seconds - $start_date seconds" +"%H:%M:%S"
+}
+
+# ct_get_image_size_uncompresseed
+# -------------------------------
+# Shows uncompressed image size in MB
+# Argument: image_name - image locally available
+ct_get_image_size_uncompresseed() {
+  local image_name=$1
+  local size_bytes
+  size_bytes=$(docker inspect "${image_name}" -f '{{.Size}}')
+  echo "$(( size_bytes / 1024 / 1024 ))MB"
+}
+
+# ct_get_image_size_compresseed
+# -------------------------------
+# Shows compressed image size in MB
+# This is a slight hack, that counts compressed size based on the compressed
+# content. It might not be entirely same as what docker pull shows, but should
+# be close enough.
+# Argument: image_name - image locally available
+ct_get_image_size_compresseed() {
+  local image_name=$1
+  local size_bytes
+  size_bytes=$(docker save "${image_name}" | gzip - | wc --bytes)
+  echo "$(( size_bytes / 1024 / 1024 ))MB"
 }
 
 # vim: set tabstop=2:shiftwidth=2:expandtab:

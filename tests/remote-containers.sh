@@ -1,12 +1,12 @@
 #! /bin/bash
 
-declare -A IMAGES
+IMAGE_REVISION=master
+test_short_summary=""
+TESTSUITE_RESULT=1
 
-for image in ${TESTED_IMAGES}; do
-    IMAGES[$image]=master
-done
-
-OS=centos7
+test -n "${OS-}" || (echo 'make sure $OS is defined' >&2 ; exit 1)
+test -n "${TESTED_IMAGE-}" || (echo 'make sure $TESTED_IMAGE is defined' >&2 ; exit 1)
+test -n "${TESTED_SCENARIO-}" || (echo 'make sure $TESTED_SCENARIO is defined' >&2 ; exit 1)
 
 MERGE_INTO=origin/master
 
@@ -26,7 +26,8 @@ analyse_commits ()
     # TODO: If we wanted to test "after PR merge", this needs to take some
     # argument specifying how long we should look in the commit history.
     git merge-base --is-ancestor "$MERGE_INTO" HEAD \
-        || die "Can not be --ff merged into $MERGE_INTO"
+        || die "Please rebase the commit '$(git rev-parse --short HEAD)'" \
+               "to allow --ff merge into '$MERGE_INTO' branch"
 
     while read line; do
         case $line in
@@ -38,70 +39,74 @@ analyse_commits ()
                 IFS=$old_IFS
                 set -- $1 $2
                 info "PR commits ask for testing $1 from PR $2"
-                IMAGES[$1]=$2
+                IMAGE_REVISION=$2
                 ;;
         esac
     done < <(git log --format=%B --reverse "$MERGE_INTO"..HEAD)
 }
 
+archive_common()
+{
+  local archive=$1
+  tar czf $archive --exclude=".git" .
+}
+
+final_cleanup() {
+  rm $common_archive
+  if [[ $TESTSUITE_RESULT -eq 0 ]]; then
+    info "Tests for $TESTED_IMAGE succeeded."
+  else
+    info "Tests for $TESTED_IMAGE failed."
+  fi
+  exit $TESTSUITE_RESULT
+}
+
+trap final_cleanup EXIT SIGINT
 analyse_commits
+common_archive=/tmp/common-$RANDOM.tar.gz
+archive_common $common_archive
 
-rc=true
-for image in "${!IMAGES[@]}"; do
-    if test -e "$image"; then
-        rc=false
-        error "directory '$image' exists"
-        continue
+# We don't want to remove user's WIP stuff.
+test -e "$TESTED_IMAGE" && die "directory '$TESTED_IMAGE' exists"
+
+(   testdir=$PWD
+    _cleanup () {
+        set -x
+        # Ensure the cleanup finishes!
+        trap '' INT
+        # Go back, wherever we are.
+        cd "$testdir"
+        # Try to cleanup, if available (and if needed).
+        make clean -C "$TESTED_IMAGE" || :
+        # Drop the image sources.
+        test ! -d "$TESTED_IMAGE" || rm -rf "$TESTED_IMAGE"
+    }
+
+    info "Testing $TESTED_IMAGE image"
+
+    # Use --recursive even if we remove 'common', because there might be
+    # other git submodules which need to be tested.
+    git clone --recursive -q https://github.com/sclorg/"$TESTED_IMAGE".git
+    cd "$TESTED_IMAGE"
+
+    if ! test "${IMAGE_REVISION}" = master; then
+        info "Fetching $TESTED_IMAGE PR ${IMAGE_REVISION}"
+        git fetch origin "pull/${IMAGE_REVISION}/head":PR_BRANCH
+        git checkout PR_BRANCH
+        git submodule update
     fi
 
-    (   set -e
-        testdir=$PWD
-        cleanup () {
-            set -x
-            # Ensure the cleanup finishes!
-            trap '' INT
-            # Go back, wherever we are.
-            cd "$testdir"
-            # Try to cleanup, if available (and if needed).
-            make clean -C "$image" || :
-            # Drop the image sources.
-            test ! -d "$image" || rm -rf "$image"
-        }
-        trap cleanup EXIT
+    # We fail if the 'common' directory doesn't exist.
+    test -d common
+    rm -rf common && mkdir common
+    info "Replacing common with PR's version"
+    tar xvf $common_archive --directory=./common/ > /dev/null
 
-        info "Testing $image image"
+    # TODO: The PS4 hack doesn't work if we run the testsuite as UID=0.
+    PS4="+ [$TESTED_IMAGE] " make TARGET="$OS" $TESTED_SCENARIO
+    result=$?
 
-        # Use --recursive even if we remove 'common', because there might be
-        # other git submodules which need to be tested.
-        git clone --recursive -q https://github.com/sclorg/"$image".git
-        cd "$image"
-
-        revision=${IMAGES[$image]}
-        if ! test "$revision" = master; then
-            info "Fetching $image PR $revision"
-            git fetch origin "pull/$revision/head":PR_BRANCH
-            git checkout PR_BRANCH
-            git submodule update
-        fi
-
-        # We fail if the 'common' directory doesn't exist.
-        test -d common
-        rm -rf common
-        info "Replacing common with PR's version"
-        ln -s ../ common
-
-        # TODO: Do we have to test everything?
-        PS4="+ [$image] " make TARGET="$OS" test
-
-        # Cleanup.
-        make clean
-    )
-
-    # Note that '( set -e ; false ) || blah' doesn't work as one expects.
-    if test $? -ne 0; then
-        rc=false
-        error "Tests for $image failed"
-    fi
-done
-
-$rc
+    _cleanup
+    exit $result
+)
+TESTSUITE_RESULT=$?
